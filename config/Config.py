@@ -443,7 +443,7 @@ class Config(object):
                 if bad_counts == self.early_stopping_patience:
                     print("Early stopping at epoch %d" % (epoch))
                     break
-        if best_model == None:
+        if best_model is None:
             best_model = self.trainModel.state_dict()
             best_epoch = self.train_times - 1
             best_hit10 = self.valid(self.trainModel)
