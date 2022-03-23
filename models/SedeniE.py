@@ -76,8 +76,8 @@ class SedeniE(Model):
 
     @classmethod
     def _smult(cls, arg1, arg2):
-        assert len(arg1.shape) == 2
-        assert len(arg2.shape) == 2
+        assert len(arg1.shape) == 3
+        assert len(arg2.shape) == 3
         assert arg1.shape[0] == cls.VAL_DIM
         assert arg2.shape[0] == cls.VAL_DIM
         a, b = torch.split(arg1, cls.VAL_DIM//2)

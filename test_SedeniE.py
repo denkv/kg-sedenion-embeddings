@@ -5,7 +5,7 @@ import unittest
 
 
 zero = torch.zeros(16)
-e = [torch.cat((torch.zeros(i), torch.ones(1), torch.zeros(15 - i))).unsqueeze(1) for i in range(0, 16)]
+e = [torch.cat((torch.zeros(i), torch.ones(1), torch.zeros(15 - i))).unsqueeze(1).unsqueeze(2) for i in range(0, 16)]
 r1 = \
     torch.tensor([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], dtype=torch.float64)
 i1 = \
