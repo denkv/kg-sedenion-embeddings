@@ -8,7 +8,7 @@ from models import SedeniE
 parser = argparse.ArgumentParser()
 parser.add_argument('--input', required=True)
 parser.add_argument('--output', required=True)
-parser.add_argument('--train', required=True)
+parser.add_argument('--train', required=True, type=int)
 parser.add_argument('--bern', required=True, type=int, choices=[0, 1])
 parser.add_argument('--dimension', required=True, type=int)
 parser.add_argument('--lmbda', required=True, type=float)
