@@ -422,6 +422,7 @@ class Config(object):
                 loss = self.train_one_step()
                 res += loss
             print("Epoch %d | loss: %f" % (epoch, res))
+            assert torch.isnan(torch.tensor(res)).sum() == 0, "Loss should not be nan"
             if (epoch + 1) % self.save_steps == 0:
                 print("Epoch %d has finished, saving..." % (epoch))
                 self.save_checkpoint(self.trainModel.state_dict(), epoch)

@@ -88,8 +88,11 @@ class SedeniE(Model):
 
     @classmethod
     def _snorm(cls, arg):
-        assert arg.shape[0] == cls.VAL_DIM
-        return arg.div(arg.pow(2).sum(0).sqrt())
+        norm = arg.norm(dim=0, p=2).detach()
+        norm = norm.add(norm == 0)
+        result = arg.div(norm)
+        # assert result.isfinite().all()
+        return result
 
     def _calc(self, h, t, r):
         r = self._snorm(r)
@@ -112,7 +115,7 @@ class SedeniE(Model):
         e_t = self.embed_entities(self.batch_t)
         e_r = self.embed_relations(self.batch_r)
         score = self._calc(e_h, e_t, e_r)
-        regul = torch.stack((e_h, e_t)).pow(2).mean(1).sum()
+        regul = torch.stack((e_h, e_t)).pow(2).mean((0, 1, 2)).sum()
         regul2 = e_r.pow(2).mean(1).sum()
         return self.loss(score, regul, regul2)
 
