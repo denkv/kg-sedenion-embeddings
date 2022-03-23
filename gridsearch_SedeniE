@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+INPUT="$1"
+OUTPUT="$2"
+mkdir -p "$OUTPUT/logs"
+parallel --verbose --tag --jobs 1 --joblog "$OUTPUT/joblog" --results "$OUTPUT/logs/{#} {}/" \
+./train_SedeniE.py --input "$INPUT" --output "$OUTPUT/data/{#}" --train {1} --bern {2} --dimension {3} --lmbda {4} --lmbda2 {5} --ent-neg-rate {6} \
+::: 100000 \
+::: 0 1 \
+::: 25 \
+::: 0 0.01 0.05 0.1 0.2 \
+::: 0 0.01 0.05 0.1 0.2 \
+::: 1 5 10 20
