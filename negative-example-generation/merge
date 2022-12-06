@@ -1,0 +1,7 @@
+#!/bin/bash
+set -eu
+FILES=$(ls "$1-neg-"*)
+PARTS=$(echo "$FILES" |wc -l)
+N=$(expr $(wc -l <"$1") / $PARTS)
+OUT="$1-neg"
+head -q -n"$N" $FILES >"$OUT"

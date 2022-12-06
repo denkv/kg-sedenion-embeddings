@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+from collections import defaultdict
+from tqdm import tqdm
+import argparse
+import random
+import re
+
+
+types = ['domain', 'range', 'domainrange', 'property', 'random']
+rdf_type = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type'
+rdfs_domain = 'http://www.w3.org/2000/01/rdf-schema#domain'
+rdfs_range = 'http://www.w3.org/2000/01/rdf-schema#range'
+pattern = re.compile('<(.+)> <(.+)> <(.+)> .')
+remove_pattern = re.compile('^(?:http://rdf.freebase.com/ns|http://www.w3.org/2006/03/wn/wn20/schema/)')
+slash_pattern = re.compile('\\.(?!\\.)')
+mapping = {
+    'seeAlso': '_also_see',
+    'derivationallyRelated': '_derivationally_related_form',
+    'has_part': '_has_part',
+    'hypernymOf': '_hypernym',
+    'instance_hypernym': '_instance_hypernym',
+    'memberMeronymOf': '_member_meronym',
+    'has_domain_region': '_member_of_domain_region',
+    'has_domain_usage': '_member_of_domain_usage',
+    'similarTo': '_similar_to',
+    'domain_topic': '_synset_domain_topic_of',
+    'sameVerbGroupAs': '_verb_group',
+}
+
+
+def read_tsv_triples(path):
+    with open(path, 'r') as file:
+        for line in tqdm(file, desc=path):
+            yield line.rstrip().split('\t', maxsplit=3)
+
+
+def load_all(files):
+    entities = set()
+    properties = set()
+    triples = set()
+    for path in files:
+        for s, p, o in read_tsv_triples(path):
+            entities.add(s)
+            properties.add(p)
+            entities.add(o)
+            triples.add(f'{s} {p} {o}')
+    return entities, properties, triples
+
+
+def clean_uri(uri):
+    uri = re.sub(slash_pattern, '/', re.sub(remove_pattern, '', uri))
+    return mapping.get(uri, uri)
+
+
+def load_kg(path, entities, properties, domain=True, range=True):
+    kg = defaultdict(lambda: defaultdict(set))
+    with open(path, 'r') as file:
+        for line in tqdm(file, desc=path):
+            match = pattern.match(line)
+            assert match
+            s, p, o = match.groups()
+            s, o = map(clean_uri, (s, o))
+            if p == rdf_type:
+                if s in entities:
+                    kg['ent_class'][s].add(o)
+                    kg['class_ent'][o].add(s)
+            elif domain and p == rdfs_domain:
+                if s in properties:
+                    kg['prop_domain'][s].add(o)
+            elif p == rdfs_range:
+                if s in properties:
+                    kg['prop_range'][s].add(o)
+    kg['class_ent'] = {k: sorted(v) for k, v in kg['class_ent'].items()}
+    if domain:
+        kg['prop_domain'] = {k: sorted(v) for k, v in kg['prop_domain'].items()}
+        for p in properties:
+            if p in kg['prop_domain']:
+                classes = kg['prop_domain'][p]
+                first_class_ent = kg['class_ent'][classes[0]]
+                kg['classes_ent'][str(classes)] = [e for e in first_class_ent if not [1 for c in classes[1:] if c not in kg['ent_class'][e]]]
+                assert len(kg['classes_ent'][str(classes)]) != 0, f'No entities in domain of {p} ({kg["prop_domain"][p]})'
+    if range:
+        kg['prop_range'] = {k: sorted(v) for k, v in kg['prop_range'].items()}
+        for p in properties:
+            if p in kg['prop_range']:
+                classes = kg['prop_range'][p]
+                first_class_ent = kg['class_ent'][classes[0]]
+                kg['classes_ent'][str(classes)] = [e for e in first_class_ent if not [1 for c in classes[1:] if c not in kg['ent_class'][e]]]
+                assert len(kg['classes_ent'][str(classes)]) != 0, f'No entities in range of {p} ({kg["prop_range"][p]})'
+    return kg
+
+
+def entity_of_all_types(classes, entities, kg, rnd):
+    classes = sorted(classes)
+    print(f'Classes: {classes}')
+    first_class_ent = kg['class_ent'][classes[0]] if len(classes) else entities
+    all_classes_ent = [e for e in first_class_ent if not [1 for c in classes[1:] if c not in kg['ent_class'][e]]]
+    return rnd.choice(all_classes_ent)
+
+
+def in_any(element, *containers):
+    for c in containers:
+        if element in c:
+            return True
+    return False
+
+
+def negatives(path, entities, properties, positives, kg, type, rnd):
+    sorted_entities = sorted(entities)
+    sorted_properties = sorted(properties)
+    generated_negatives = set()
+    for pos_s, pos_p, pos_o in read_tsv_triples(path):
+        assert pos_s in entities, f'Unknown entity: {pos_s}'
+        assert pos_p in properties, f'Unknown property: {pos_p}'
+        assert pos_o in entities, f'Unknown entity: {pos_o}'
+        neg_s = None
+        neg_p = None
+        neg_o = None
+        if type == 'random':
+            while True:
+                neg_s = rnd.choice(sorted_entities)
+                neg_p = rnd.choice(sorted_properties)
+                neg_o = rnd.choice(sorted_entities)
+                if not in_any(f'{neg_s} {neg_p} {neg_o}', positives, generated_negatives):
+                    break
+        elif type == 'domainrange':
+            neg_p = pos_p
+            while True:
+                neg_s = rnd.choice(sorted_entities)
+                neg_o = rnd.choice(sorted_entities)
+                if not in_any(f'{neg_s} {neg_p} {neg_o}', positives, generated_negatives):
+                    break
+        else:
+            if type == 'domain':
+                s_candidates = kg['classes_ent'][str(kg['prop_domain'][pos_p])] if pos_p in kg['prop_domain'] else sorted_entities
+                candidates = ((s, pos_p, pos_o) for s in s_candidates)
+            elif type == 'range':
+                o_candidates = kg['classes_ent'][str(kg['prop_range'][pos_p])] if pos_p in kg['prop_range'] else sorted_entities
+                candidates = ((pos_s, pos_p, o) for o in o_candidates)
+            elif type == 'property':
+                candidates = ((pos_s, p, pos_o) for p in sorted_properties)
+            else:
+                raise ValueError(type)
+            candidates = [(s, p, o) for s, p, o in candidates if not in_any(f'{s} {p} {o}', positives, generated_negatives)]
+            if len(candidates) > 0:
+                neg_s, neg_p, neg_o = rnd.choice(candidates)
+        if neg_s is not None and neg_p is not None and neg_o is not None:
+            generated_negatives.add(f'{neg_s} {neg_p} {neg_o}')
+            yield neg_s, neg_p, neg_o
+        else:
+            print(f'No possibilities to corrupt the triple: {pos_p} {pos_p} {pos_o}; domain: {kg["prop_domain"][pos_p] if pos_p in kg["prop_domain"] else "all"}; range: {kg["prop_range"][pos_p] if pos_p in kg["prop_range"] else "all"}')
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--kg', required=True, help='Property domain, range and entity type data in simple N-Triples format')
+    parser.add_argument('--type', required=True, choices=types)
+    parser.add_argument('--seed', required=True, type=int)
+    parser.add_argument('files', metavar='file', nargs='+', help='Positive example sets in TSV format')
+    args = parser.parse_args()
+    print(f'Arguments: {vars(args)}')
+
+    entities, properties, triples = load_all(files=args.files)
+    print(f'Entities: {len(entities)}')
+    print(f'Properties: {len(properties)}')
+    print(f'Triples: {len(triples)}')
+
+    kg = load_kg(args.kg, entities=entities, properties=properties)
+
+    print(f'Properties without rdf:domain: {len(properties - kg["prop_domain"].keys())}')
+    print(f'Properties without rdf:range: {len(properties - kg["prop_range"].keys())}')
+    print(f'Entities without rdf:type: {len(entities) - len(kg["ent_class"])}')
+
+    rnd = random.Random(args.seed)
+
+    for path in args.files:
+        with open(f'{path}-neg-{args.type}', 'w') as out:
+            for s, p, o in negatives(path, entities=entities, properties=properties, positives=triples, kg=kg, type=args.type, rnd=rnd):
+                out.write(f'{s}\t{p}\t{o}\n')
+
+
+if __name__ == '__main__':
+    main()

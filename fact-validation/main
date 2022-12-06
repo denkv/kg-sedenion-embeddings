@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+from functools import partial
+from ray.tune import CLIReporter
+from ray.tune.schedulers import ASHAScheduler
+from sklearn.metrics import roc_auc_score
+from torch import nn, optim
+import argparse
+import os
+import random
+import ray.tune as tune
+import time
+import torch
+
+from embeddings import load_embedding_model
+
+def accuracy(labels, ys):
+    return (ys.round() == labels).sum().item() / labels.size(0)
+
+def compute_metric(*, model, data, metric=roc_auc_score, device):
+    with torch.no_grad():
+        xs, labels = data
+        xs, labels = xs.to(device), labels.to(device)
+        ys = model(xs)
+        ys = ys.to(device)
+        return metric(labels, ys)
+
+def write_results(*, model, data, path, device):
+    with torch.no_grad():
+        xs, labels = data
+        xs, labels = xs.to(device), labels.to(device)
+        ys = model(xs)
+        ys = ys.to(device)
+        with open(path, 'w') as f:
+            f.writelines(str(item) + '\n' for item in ys.numpy())
+
+class Unpacker(nn.Module):
+    def forward(self, input):
+        assert input.shape[1] == 1, f'{input.shape}[1] == 1'
+        return input.squeeze(1)
+
+class FCNN(nn.Module):
+    def __init__(self, in_features=100, layer1_size=512, layer1_activation=nn.ReLU, layer2_size=256, layer2_activation=nn.ReLU, activation=nn.Sigmoid):
+        super(FCNN, self).__init__()
+
+        layer1 = nn.Linear(in_features=in_features, out_features=layer1_size)
+        nn.init.xavier_uniform_(layer1.weight, gain=1)
+        nn.init.constant_(layer1.bias, 0)
+        modules = [
+            layer1, # input → 1st
+            nn.Dropout(p=0.5),
+            nn.BatchNorm1d(num_features=layer1_size),
+            layer1_activation(),
+            nn.Linear(layer1_size, layer2_size if layer2_size > 0 else 1), # 1st → 2nd
+        ]
+        if layer2_size > 0:
+            layer2 = nn.Linear(layer2_size, 1)
+            nn.init.xavier_uniform_(layer2.weight, gain=1)
+            nn.init.constant_(layer2.bias, 0)
+            modules += [
+                nn.Dropout(p=0.5),
+                nn.BatchNorm1d(num_features=layer2_size),
+                layer2_activation(),
+                layer2, # 2nd → output
+            ]
+        modules += [
+            activation(),
+            Unpacker(),
+        ]
+        self.main_module = nn.Sequential(*modules)
+
+    def forward(self, x):
+        return self.main_module(x)
+
+def train(config, data_path, embeddings, dataset: str, epochs=10_000, device='cpu', checkpoint_dir=None):
+    embedding_model = load_embedding_model(model_name=embeddings, dataset=dataset, device=device)
+    train_data, valid_data, test_data = load_data(data_path, embedding_model=embedding_model, device=device)
+
+    weight_decay = config['weight_decay']
+    learning_rate = config['learning_rate']
+    del config['weight_decay']
+    del config['learning_rate']
+
+    model = FCNN(**config)
+    model.to(device)
+    criterion = nn.MSELoss()
+    optimizer = optim.SGD(model.parameters(), lr=learning_rate, momentum=0.9, weight_decay=weight_decay)
+    if checkpoint_dir:
+        model_state, optimizer_state = torch.load(os.path.join(checkpoint_dir, "checkpoint"))
+        model.load_state_dict(model_state)
+        optimizer.load_state_dict(optimizer_state)
+
+    for epoch in range(epochs):
+        inputs, labels = train_data
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+
+        with torch.no_grad():
+            x, labels = valid_data
+            y = model(x)
+            valid_loss = criterion(y, labels).item()
+
+            if tune.session.is_session_enabled():
+                if (epoch + 1) % 1000 == 0:
+                    with tune.checkpoint_dir(step=epoch) as checkpoint_dir:
+                        torch.save((model.state_dict(), optimizer.state_dict()), os.path.join(checkpoint_dir, 'checkpoint'))
+                tune.report(
+                    loss=loss.item(),
+                    valid_loss=valid_loss,
+                    accuracy=compute_metric(model=model, data=valid_data, metric=accuracy, device=device),
+                    # roc_auc=compute_metric(model=model, data=valid_data, metric=roc_auc_score, device='cpu'),
+                )
+            else:
+                if (epoch + 1) % 1000 == 0:
+                    print('valid', dict(
+                        epoch=epoch,
+                        loss=loss.item(),
+                        valid_loss=valid_loss,
+                        accuracy=compute_metric(model=model, data=valid_data, metric=accuracy, device=device),
+                        # roc_auc=compute_metric(model=model, data=valid_data, metric=roc_auc_score, device='cpu'),
+                    ))
+
+    del train_data
+    del valid_data
+    model = model.to('cpu')
+
+    print('test', dict(
+        accuracy=compute_metric(model=model, data=test_data, metric=accuracy, device='cpu'),
+        roc_auc=compute_metric(model=model, data=test_data, metric=roc_auc_score, device='cpu'),
+    ))
+
+    run_id = str(int(time.time()))
+
+    if not tune.session.is_session_enabled() and epochs != 0:
+        path = os.path.join('train_checkpoints', run_id)
+        print(f'Saving config and checkpoint to {path}...')
+        os.makedirs(path)
+        torch.save((model.state_dict(), optimizer.state_dict()), os.path.join(path, 'checkpoint'))
+        with open(os.path.join(path, 'info'), 'w') as f:
+            f.write(f'{config=}\n{args=}\n')
+
+    if not tune.session.is_session_enabled():
+        path = os.path.join('test_results', run_id)
+        print(f'Saving test results to {path}...')
+        os.makedirs('test_results', exist_ok=True)
+        write_results(model=model, data=test_data, path=path, device='cpu')
+
+def tuning(data_path, embeddings, dataset, name, device, resume=False, max_epochs=100_000):
+    config = dict(
+        in_features=3 * 16 * 25, # train_data[0].shape[1],
+        learning_rate=tune.loguniform(0.000_1, 0.1),
+        weight_decay=tune.loguniform(0.000_000_1, 0.000_1),
+        layer1_size=tune.grid_search([128, 256, 512, 1024]),
+        layer1_activation=tune.grid_search([nn.ReLU, nn.LeakyReLU]),
+        layer2_size=tune.grid_search([0]),
+        layer2_activation=tune.grid_search([nn.ReLU, nn.LeakyReLU]),
+        activation=nn.Sigmoid,
+    )
+
+    scheduler = ASHAScheduler(max_t=max_epochs, grace_period=50, reduction_factor=2)
+    reporter = CLIReporter(
+        metric_columns=['valid_loss', 'accuracy', 'roc_auc', 'training_iteration'],
+        max_report_frequency=120,
+    )
+
+    result = tune.run(
+        partial(train, data_path=data_path, embeddings=embeddings, dataset=dataset, device=device),
+        resources_per_trial={"cpu": 1, "gpu": 1},
+        # max_concurrent_trials=2,
+        config=config,
+        metric='valid_loss',
+        mode='min',
+        scheduler=scheduler,
+        progress_reporter=reporter,
+        name=name,
+        resume=resume,
+        log_to_file=True,
+        fail_fast=True,
+    )
+    best_trial = result.get_best_trial("accuracy", "max", "last")
+    if best_trial is not None:
+        print("Best trial config: {}".format(best_trial.config))
+        print("Best trial final validation loss: {}".format(
+            best_trial.last_result["valid_loss"]))
+        print("Best trial final validation accuracy: {}".format(
+            best_trial.last_result["accuracy"]))
+        # print("Best trial final validation roc_auc: {}".format(
+        #     best_trial.last_result["roc_auc"]))
+
+        config = dict(**best_trial.config)
+        del config['weight_decay']
+        del config['learning_rate']
+        best_trained_model = FCNN(**config)
+        best_trained_model.to(device)
+
+        best_checkpoint_dir = best_trial.checkpoint.value
+        model_state, optimizer_state = torch.load(os.path.join(best_checkpoint_dir, "checkpoint"))
+        best_trained_model.load_state_dict(model_state)
+
+        embedding_model = load_embedding_model(model_name=embeddings, dataset=dataset, device='cpu')
+        test_data = load_data(data_path, embedding_model=embedding_model, device='cpu')[2]
+        best_trained_model.to('cpu')
+        best_trial_test_metrics = dict(
+            accuracy=compute_metric(model=best_trained_model, data=test_data, metric=accuracy, device='cpu'),
+            roc_auc=compute_metric(model=best_trained_model, data=test_data, metric=roc_auc_score, device='cpu'),
+        )
+        print(f"Best trial performance on the test set: {best_trial_test_metrics}")
+
+def load_tsv_triples(file):
+    with open(file) as fd:
+        return [line.strip().split()[0:3] for line in fd]
+
+def prepare_dataset(positives=[], negatives=[], embedding_model=None, device=None):
+    pos_x = embedding_model.encode(positives)
+    neg_x = embedding_model.encode(negatives)
+    x = indexed_triples_to_flat_emb(torch.cat((pos_x, neg_x)), embedding_model=embedding_model, device=device)
+    y = torch.cat((torch.ones(len(positives)), torch.zeros(len(negatives)))).to(device)
+    return x, y
+
+def indexed_triples_to_flat_emb(data, embedding_model, device):
+    s_idx = data[:, 0]
+    p_idx = data[:, 1]
+    o_idx = data[:, 2]
+    e_s = embedding_model.ent_emb(s_idx)
+    e_p = embedding_model.rel_emb(p_idx)
+    e_o = embedding_model.ent_emb(o_idx)
+    return torch.cat((e_s, e_p, e_o), 1).to(device)
+
+def load_pos_neg(pos_path, neg_path, embedding_model, device, limit=None):
+    pos = load_tsv_triples(pos_path)
+    neg = load_tsv_triples(neg_path)
+    assert limit is None or limit <= len(pos) and limit <= len(neg)
+    return prepare_dataset(positives=pos[:limit], negatives=neg[:limit], embedding_model=embedding_model, device=device)
+
+def load_data(path, embedding_model, device):
+    neg_suffix = '-neg'
+
+    train_data = load_pos_neg(os.path.join(os.path.dirname(__file__), path, 'train.txt'), os.path.join(os.path.dirname(__file__), path, 'train.txt' + neg_suffix), embedding_model=embedding_model, device=device, limit=args.train_set_stop)
+
+    valid_data = load_pos_neg(os.path.join(os.path.dirname(__file__), path, 'valid.txt'), os.path.join(os.path.dirname(__file__), path, 'valid.txt' + neg_suffix), embedding_model=embedding_model, device=device)
+
+    test_data = load_pos_neg(os.path.join(os.path.dirname(__file__), path, 'test.txt'), os.path.join(os.path.dirname(__file__), path, 'test.txt' + neg_suffix), embedding_model=embedding_model, device='cpu')
+
+    return train_data, valid_data, test_data
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--name', type=str, required=True, help='the experiment name for Ray Tune')
+    parser.add_argument('--resume', action='store_true', help='resume previously interrupted experiment')
+    parser.add_argument('--device', choices=['auto', 'cuda', 'cpu'], default='auto', help='the device for Torch computations')
+    parser.add_argument('--seed', type=int, default=1, help='the random seed')
+    parser.add_argument('--embeddings', choices=['SedeniE', 'QMult', 'QuatE'], default='SedeniE', help='name of the embedding model to use')
+    parser.add_argument('--data', type=str, required=True, help='path to the dataset')
+    parser.add_argument('--dataset', choices=['FB15k-237', 'WN18RR'], required=True, help='which dataset to use')
+    parser.add_argument('--train-set-stop', type=int, default=None, help='how much items from the training set to use (for testing)')
+    parser.add_argument('--checkpoint-dir', type=str, help='load a checkpoint for test')
+    parser.add_argument('command', choices=['test', 'train', 'tune'], help='what to do')
+    args = parser.parse_args()
+
+    rnd = random.Random(args.seed)
+    device = args.device if args.device != 'auto' else 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f'{device=}')
+
+    if args.command == 'test':
+        train_config = dict(
+            in_features=3 * 16 * 25,
+            layer1_size=1024,
+            layer1_activation=nn.LeakyReLU,
+            layer2_size=128,
+            layer2_activation=nn.Tanh,
+            activation=nn.Sigmoid,
+            learning_rate=0.1,
+            weight_decay=1e-7,
+        )
+        train(train_config, checkpoint_dir=args.checkpoint_dir, data_path=args.data, embeddings=args.embeddings, dataset=args.dataset, epochs=0, device=device)
+    elif args.command == 'train':
+        train_config = dict(
+            in_features=3 * 16 * 25, # train_data[0].shape[1],
+            layer1_size=1024,
+            layer1_activation=nn.LeakyReLU,
+            layer2_size=128,
+            layer2_activation=nn.Tanh,
+            activation=nn.Sigmoid,
+            learning_rate=0.1,
+            weight_decay=1e-7,
+        )
+        print(f'{train_config=}')
+        train(train_config, data_path=args.data, embeddings=args.embeddings, dataset=args.dataset, epochs=10_000, device=device)
+    elif args.command == 'tune':
+        tuning(data_path=args.data, embeddings=args.embeddings, dataset=args.dataset, name=args.name, device=device, resume=args.resume, max_epochs=10_000)

@@ -1,0 +1,15 @@
+Supported datasets: FB15K-237, WN18RR
+
+Usage:
+
+./generate --kg knowledge_graph.nt --seed SEED --type TYPE path/to/{train,valid,test}.txt
+./merge path/to/train.txt
+./merge path/to/valid.txt
+./merge path/to/test.txt
+
+SEED is integer
+TYPE is domain, range, domainrange, property or random
+
+Source of knowledge_graph.nt:
+https://hobbitdata.informatik.uni-leipzig.de/FactCheck/FB15k-237/train_valid_dr_n_types.nt
+https://hobbitdata.informatik.uni-leipzig.de/FactCheck/WN18RR/wn18rr_knowledge_graph.nt
