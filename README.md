@@ -1,9 +1,7 @@
 # Sedenion Embeddings
 
-- [Pre-trained embedding models](https://hobbitdata.informatik.uni-leipzig.de/teaching/theses/sedenion-embeddings/models/)
 - [Negative example generation](./negative-example-generation)
 - [Fact validation](./fact-vadlidation)
-- [Fact validation predictions](https://hobbitdata.informatik.uni-leipzig.de/teaching/theses/sedenion-embeddings/predictions/)
 
 # Preparation
 Run `make install`.
